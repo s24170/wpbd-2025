@@ -1,0 +1,15 @@
+{
+  "name": "pg-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "plugin.name": "pgoutput",
+    "database.hostname": "postgres-db",
+    "database.port": "5432",
+    "database.user": "postgres-wpbd-user",
+    "database.password": "postgres-wpbd-pwd",
+    "database.dbname": "postgres-wpbd",
+    "slot.name": "debezium_slot",
+    "publication.autocreate.mode": "all_tables",
+    "topic.prefix": "postgres-db"
+  }
+}

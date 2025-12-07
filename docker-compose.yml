@@ -1,0 +1,179 @@
+services:
+  postgresql:
+    image: postgres:14
+    container_name: kafka-postgres
+    hostname: postgresql
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: "${CONDUKTOR_POSTGRES_DB}"
+      POSTGRES_USER: "${CONDUKTOR_POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${CONDUKTOR_POSTGRES_PASSWORD}"
+      POSTGRES_HOST_AUTH_METHOD: "scram-sha-256"
+
+  conduktor-console:
+    image: conduktor/conduktor-console:1.36.2
+    ports:
+      - "8080:8080"
+    volumes:
+      - conduktor_data:/var/conduktor
+    environment:
+      CDK_DATABASE_URL: "postgresql://${CONDUKTOR_POSTGRES_USER}:${CONDUKTOR_POSTGRES_PASSWORD}@postgresql:5432/${CONDUKTOR_POSTGRES_DB}"
+      CDK_CLUSTERS_0_ID: "default"
+      CDK_CLUSTERS_0_NAME: "My Local Kafka Cluster"
+      CDK_CLUSTERS_0_COLOR: "#0013E7"
+      CDK_CLUSTERS_0_BOOTSTRAPSERVERS: "PLAINTEXT://${KAFKA_BOOTSTRAP}"
+      CDK_ADMIN_EMAIL: "${CDK_ADMIN_EMAIL}"
+      CDK_ADMIN_PASSWORD: "${CDK_ADMIN_PASSWORD}"
+
+  kafka1:
+    image: confluentinc/cp-kafka:8.0.0
+    hostname: kafka1
+    container_name: kafka1
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+      - "9999:9999"
+      - "9099:9099"
+    environment:
+      CLUSTER_ID: "${KAFKA_CLUSTER_ID}"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka1:9099"
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,DOCKER://0.0.0.0:29092,CONTROLLER://0.0.0.0:9099
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:19092,EXTERNAL://${DOCKER_HOST_IP}:9092,DOCKER://host.docker.internal:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,DOCKER:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "true"
+
+  postgres-db:
+    image: postgres:alpine
+    container_name: postgres-wpbd
+    environment:
+      POSTGRES_DB: "${DB_NAME}"
+      POSTGRES_USER: "${DB_USER}"
+      POSTGRES_PASSWORD: "${DB_PASSWORD}"
+    ports:
+      - "${DB_PORT}:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME} -h localhost" ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    command: >
+      postgres -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+
+  debezium:
+    image: quay.io/debezium/connect
+    container_name: debezium
+    ports:
+      - "8083:8083"
+    depends_on:
+      - kafka1
+      - postgres-db
+    environment:
+      BOOTSTRAP_SERVERS: "${KAFKA_BOOTSTRAP}"
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: my_connect_configs
+      OFFSET_STORAGE_TOPIC: my_connect_offsets
+      STATUS_STORAGE_TOPIC: my_connect_statuses
+
+  init-pg-cdc:
+    image: curlimages/curl:8.8.0
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    volumes:
+      - ./connectors:/connectors:ro
+    command: >
+      sh -c '
+        set -e;
+        until curl -fsS http://debezium:8083/connectors >/dev/null; do
+          echo "Waiting for Kafka Connect..."; sleep 2;
+        done;
+        curl -fsS -X POST \
+          -H "Content-Type: application/json" \
+          --data @/connectors/register-postgres.json \
+          http://debezium:8083/connectors &&
+        echo "Connector pg-cdc applied."
+      '
+    restart: "no"
+
+  db-populator-live:
+    build: ./db-populator
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    environment:
+      DB_HOST: "${DB_HOST}"
+      DB_PORT: "${DB_PORT}"
+      DB_NAME: "${DB_NAME}"
+      DB_USER: "${DB_USER}"
+      DB_PASSWORD: "${DB_PASSWORD}"
+    command: >
+      bash -lc '
+        until pg_isready -h ${DB_HOST} -U "${DB_USER}" -d "${DB_NAME}"; do sleep 2; done
+        python /app/populate_db.py
+      '
+    restart: unless-stopped
+
+  spark-master:
+    image: spark:4.0.0-scala2.13-java21-python3-ubuntu
+    container_name: "spark-master"
+    ports:
+      - "7077:7077"
+      - "8082:8080"
+    command: >
+      bash -lc "/opt/spark/sbin/start-master.sh --port 7077 --webui-port 8080 && tail -f /dev/null"
+
+  spark-worker:
+    image: spark:4.0.0-scala2.13-java21-python3-ubuntu
+    container_name: "spark-worker"
+    depends_on: [spark-master]
+    ports:
+      - "8084:8081"
+    command: >
+      bash -lc "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 --webui-port 8081 && tail -f /dev/null"
+
+  spark-client:
+    build:
+      context: ./spark-client
+    container_name: spark-client
+    depends_on: [ spark-master, spark-worker, kafka1 ]
+    ports:
+      - "4040:4040"
+    environment:
+      KAFKA_BOOTSTRAP: "${KAFKA_BOOTSTRAP}"
+      KAFKA_TOPIC: "${KAFKA_TOPIC}"
+    command: >
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.0,io.delta:delta-spark_2.13:4.0.0,org.apache.hadoop:hadoop-aws:3.4.1,software.amazon.awssdk:s3:2.24.6,software.amazon.awssdk:dynamodb:2.24.6,software.amazon.awssdk:sts:2.24.6
+      --exclude-packages com.amazonaws:aws-java-sdk-bundle
+      --conf spark.driver.extraJavaOptions="-Divy.home=/tmp -Divy.cache.dir=/tmp"
+      --conf spark.executor.extraJavaOptions="-Divy.home=/tmp -Divy.cache.dir=/tmp"
+      --conf spark.jars.ivy=/tmp/.ivy2
+      /app/src/spark.py
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      MINIO_DEFAULT_BUCKETS: buck1
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: [ "server", "--console-address", ":9001", "/data" ]
+
+volumes:
+  pg_data: { }
+  conduktor_data: { }

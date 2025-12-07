@@ -1,0 +1,16 @@
+name: wpbd
+channels:
+  - conda-forge
+  - defaults
+channel_priority: strict
+dependencies:
+  - python=3.11
+  - pandas
+  - faker
+  - sqlalchemy
+  - psycopg2-binary
+  - requests
+  - pyspark=4.0.0
+  - pip:
+      - python-dotenv
+      - minio
